@@ -5,6 +5,20 @@
 # Notes: H1-H4 from population electoral quantities and frozen observed text measures.
 # Outcomes and binary regressors stay 0/1; multiply estimates by 100 ONCE when
 # reporting percentage points. All inferential models cluster on municipality.
+#
+# Revision (September 2026):
+#   1. H1 adds an incumbency control and keeps races whose winner has usable text.
+#      The previous specification is still reported, labelled as such.
+#   2. Equivalence tests need MAYORAL_SESOI_PP; a message flags when it is unset.
+#   3. The empty "Unambiguous previous-cycle winner" row is replaced by a
+#      flexible length control (fixed effects for LENGTH_BINS log-length bins).
+#   4. New: joint test that the challenger gap is equal across election years.
+#   5. New: planned contrasts (general vs specific; retrospective vs prospective)
+#      from the stacked strategy model, for the H2 and H4 samples.
+#   6. New: H3 sensitivity dropping races whose top two include a candidate
+#      without an approved registration (votes later annulled).
+#   7. The stored H2 point check is renamed a regression test.
+#   8. Drive upload is optional (MAYORAL_UPLOAD) and the account is configurable.
 # ------------------------------------------------------------------------------
 
 # Required packages ------------------------------------------------------------
@@ -38,6 +52,18 @@ USE_CONFIDENT_MAIN <- TRUE
 SESOI_PP <- suppressWarnings(as.numeric(Sys.getenv("MAYORAL_SESOI_PP", "NA")))
 
 if (!is.na(SESOI_PP) && (!is.finite(SESOI_PP) || SESOI_PP <= 0)) stop("Invalid SESOI")
+if (is.na(SESOI_PP))
+  message("MAYORAL_SESOI_PP is not set: H1 equivalence-test columns will be NA.")
+
+# Flexible length control: number of log-length bins used as fixed effects
+LENGTH_BINS <- 20L
+
+# Registration statuses whose votes count as valid (H3 sensitivity)
+APPROVED_STATUS <- c("DEFERIDO", "DEFERIDO COM RECURSO")
+
+# Drive upload (set MAYORAL_UPLOAD=FALSE to keep outputs local)
+UPLOAD <- as.logical(Sys.getenv("MAYORAL_UPLOAD", "TRUE"))
+DRIVE_EMAIL <- Sys.getenv("MAYORAL_DRIVE_EMAIL", "cedricantunes07@gmail.com")
 
 # Vote margins
 MARGINS_PP <- c(5, 10, 20)
@@ -55,11 +81,11 @@ wr <- function(x, n) {
 }
 
 # My personal Google Drive folder ----------------------------------------------
-googledrive::drive_auth(email = "cedricantunes07@gmail.com")
-
-drive_folder <- googledrive::drive_get(googledrive::as_id(DRIVE_OUTPUT_FOLDER_ID))
-
-stopifnot(nrow(drive_folder) == 1L, googledrive::is_folder(drive_folder))
+if (UPLOAD || !nzchar(FRAME_PATH)) {
+  googledrive::drive_auth(email = DRIVE_EMAIL)
+  drive_folder <- googledrive::drive_get(googledrive::as_id(DRIVE_OUTPUT_FOLDER_ID))
+  stopifnot(nrow(drive_folder) == 1L, googledrive::is_folder(drive_folder))
+}
 
 if (!nzchar(FRAME_PATH)) {
   drive_files <- googledrive::drive_ls(drive_folder)
@@ -111,12 +137,18 @@ needed <- c("ELECTION_SCOPE",
             "N_UNKNOWN_INCUMBENTS",
             "SAMPLE_H4_CONFIDENT", 
             "SAMPLE_H4_ALL", 
-            "W_OBS")
+            "W_OBS",
+            "des_situacao_candidatura")
 
 if (!all(needed %in% names(d))) stop("Use analysis_frame.rds from revised script 02")
 
 stopifnot(all(d$ELECTION_SCOPE == "Ordinary"),
           all(d$N_UNKNOWN_INCUMBENTS[d$SAMPLE_H2 == 1] == 0L))
+
+# Log-length bins over the text-observed candidates (flexible length control).
+d <- d |> mutate(LENGTH_BIN = if_else(is.finite(LOG_N_WORDS),
+                                      ntile(if_else(is.finite(LOG_N_WORDS), LOG_N_WORDS, NA_real_),
+                                            LENGTH_BINS), NA_integer_))
 
 # Summaries use the actual estimation rows, including any fixed-effect removals.
 model_sample <- function(m, dat) {
@@ -149,22 +181,24 @@ wr(d |> filter(PLAN_OBSERVED == 1) |> count(ELECTED_CORPUS, ELECTED), "t_elected
 
 # H2 / H4: retain races with BOTH candidate types in each estimation sample.
 # This explicitly enforces the H4 estimand after restricting to users.
-fit_status <- function(dat, y, users = FALSE, weight = NULL, any_var = TVAR[["ANY"]]) {
+fit_status <- function(dat, y, users = FALSE, weight = NULL, any_var = TVAR[["ANY"]],
+                       length_bins = FALSE) {
   z <- dat |> filter(SAMPLE_H2 == 1, !is.na(CHALLENGER_TRUE), !is.na(.data[[y]]), is.finite(LOG_N_WORDS))
   if (users) z <- z |> filter(.data[[any_var]] == 1)
   if (!is.null(weight)) z <- z |> filter(is.finite(.data[[weight]]), .data[[weight]] > 0)
   z <- z |> group_by(RACE_ID) |> filter(n_distinct(CHALLENGER_TRUE) == 2) |> ungroup()
   if (!nrow(z)) stop("Empty incumbent/challenger estimation sample for ", y)
-  f <- as.formula(paste(y, "~ CHALLENGER_TRUE + LOG_N_WORDS | RACE_ID"))
+  f <- as.formula(if (length_bins) paste(y, "~ CHALLENGER_TRUE | RACE_ID + LENGTH_BIN") else
+    paste(y, "~ CHALLENGER_TRUE + LOG_N_WORDS | RACE_ID"))
   m <- if (is.null(weight)) feols(f, data = z, vcov = ~ MUNI) else
     feols(f, data = z, weights = z[[weight]], vcov = ~ MUNI)
   list(model = m, data = z)
 }
 
 status_table <- function(dat, vars = TVAR, users = FALSE, weight = NULL,
-                         any_var = TVAR[["ANY"]]) {
+                         any_var = TVAR[["ANY"]], length_bins = FALSE) {
   imap_dfr(vars, function(v, k) {
-    z <- fit_status(dat, v, users, weight, any_var)
+    z <- fit_status(dat, v, users, weight, any_var, length_bins)
     coefficient_pp(z$model, z$data, "CHALLENGER_TRUE") |>
       mutate(key = k, outcome = LABELS[[k]])
   }) |> mutate(p_holm = p.adjust(p.value, "holm"))
@@ -174,21 +208,22 @@ h2 <- status_table(d)
 
 wr(h2, "t_h2_main")
 
-# Independent within-race OLS point checks on the revised frame. Clustered
-# uncertainty is produced in R and is not part of these point-estimate checks.
+# Regression test: H2 point estimates must match the stored values from the
+# verified run. It guards against unintended changes; it is not an independent
+# replication.
 benchmark <- c(ANY = 6.6962737784, 
                PAST = -0.8680393808,
                GEN = 5.7454066310, 
                SPEC = 5.1759728971,
                STYLE = 3.1054033905)
 
-check_h2 <- h2 |> mutate(independent_point_check = benchmark[key],
-                         difference_pp = estimate - independent_point_check)
+check_h2 <- h2 |> mutate(stored_estimate = benchmark[key],
+                         difference_pp = estimate - stored_estimate)
 
-wr(check_h2, "t_h2_independent_point_check")
+wr(check_h2, "t_h2_regression_test")
 
 if (USE_CONFIDENT_MAIN && any(abs(check_h2$difference_pp) > .01))
-  stop("H2 point estimates differ from the independently reconstructed revised frame")
+  stop("H2 point estimates differ from the stored values of the verified run")
 
 h4 <- status_table(d, TVAR[names(TVAR) != "ANY"], users = TRUE)
 
@@ -204,6 +239,21 @@ stopifnot(all(h2$n == 14791L), all(h2$n_races == 5238L),
           all(h4_all$n == 6048L), all(h4_all$n_races == 2232L))
 
 # Strategy-specific length slopes preserve the omnibus model in the Rmd.
+# The same stacked model yields the planned contrasts the theory needs. Each
+# strategy's challenger effect is CHALLENGER_TRUE plus its interaction (zero
+# for the reference level), so contrasts are differences of those sums.
+challenger_effect <- function(strategy_var, levels) {
+  w <- c(CHALLENGER_TRUE = 1)
+  if (strategy_var != levels[1]) w[paste0("CHALLENGER_TRUE:strategy", strategy_var)] <- 1
+  w
+}
+combine_weights <- function(...) {
+  parts <- list(...)
+  nm <- unique(unlist(lapply(parts, names)))
+  setNames(vapply(nm, function(n) sum(vapply(parts, function(p)
+    if (n %in% names(p)) p[[n]] else 0, numeric(1))), numeric(1)), nm)
+}
+planned <- list()
 for (users in c(FALSE, TRUE)) {
   z <- d |> filter(SAMPLE_H2 == 1, is.finite(LOG_N_WORDS))
   if (users) z <- z |> filter(.data[[TVAR[["ANY"]]]] == 1)
@@ -218,7 +268,25 @@ for (users in c(FALSE, TRUE)) {
   test <- wald(m, keep = "CHALLENGER_TRUE:strategy", print = FALSE)
   capture.output(print(test), file = file.path(OUT_DIR,
                                                if (users) "t_h4_omnibus.txt" else "t_h2_omnibus.txt"))
+  lv <- levels(z$strategy)
+  eff <- function(key) challenger_effect(TVAR[[key]], lv)
+  contrasts <- list(
+    "General minus specific promise" =
+      combine_weights(eff("GEN"), -eff("SPEC")),
+    "Retrospective claim minus prospective promises (mean of general and specific)" =
+      combine_weights(eff("PAST"), -0.5 * eff("GEN"), -0.5 * eff("SPEC")))
+  n_strategies <- nlevels(z$strategy)
+  planned[[as.character(users)]] <- imap_dfr(contrasts, function(w, label)
+    contrast_pp(m, z, w[w != 0]) |>
+      mutate(contrast = label,
+             sample = if (users) "H4: transparency users" else "H2: incumbent-contested races",
+             n = n / n_strategies))   # stacked rows back to candidates
 }
+planned <- bind_rows(planned) |> group_by(sample) |>
+  mutate(p_holm = p.adjust(p.value, "holm")) |> ungroup()
+stopifnot(all(planned$n[planned$sample == "H2: incumbent-contested races"] == 14791L),
+          all(planned$n[planned$sample == "H4: transparency users"] == 3657L))
+wr(planned, "t_planned_contrasts")
 
 output_names <- unique(c(output_names, "t_h2_omnibus.txt", 
                          "t_h4_omnibus.txt"))
@@ -226,11 +294,15 @@ output_names <- unique(c(output_names, "t_h2_omnibus.txt",
 # H2 robustness. Holm adjustment is separate within each five-outcome family.
 robust <- bind_rows(
   h2 |> mutate(spec = "Main"),
+  # W_OBS is modelled with electoral rank as a predictor. Use it only for these
+  # communication outcomes, never for H1 or H3, where rank or election is the outcome.
   status_table(d, weight = "W_OBS") |> mutate(spec = "Candidate-observability IPW"),
   status_table(d |> filter(SAMPLE_FULLY_OBSERVED == 1)) |> mutate(spec = "Fully observed races"),
   status_table(d, vars = BASE) |> mutate(spec = "All hits"),
-  status_table(d |> filter(PRIOR_WINNER_UNAMBIGUOUS == 1)) |>
-    mutate(spec = "Unambiguous previous-cycle winner"),
+  # Replaces the former "Unambiguous previous-cycle winner" row, which SAMPLE_H2
+  # already imposes and which therefore reproduced the main row exactly.
+  status_table(d, length_bins = TRUE) |>
+    mutate(spec = paste0("Flexible length control (", LENGTH_BINS, " bins)")),
   status_table(d |> filter(PRIOR_SUPPLEMENTARY_ELECTION == 0)) |>
     mutate(spec = "No prior supplementary-election record"),
   map_dfr(sort(unique(d$YEAR)), function(y)
@@ -239,17 +311,56 @@ robust <- bind_rows(
 
 wr(robust, "t_h2_robustness")
 
+# Is the challenger gap equal across election years? One model per outcome on
+# the H2 sample, with year-specific challenger effects and length slopes (race
+# FE absorb year levels). Joint cluster-robust Wald test of the two differences
+# from 2012, plus each difference as a contrast.
+year_het <- imap_dfr(TVAR, function(v, k) {
+  z <- fit_status(d, v)$data |> mutate(Y2016 = as.integer(YEAR == 2016L),
+                                       Y2020 = as.integer(YEAR == 2020L))
+  m <- feols(as.formula(paste(v, "~ CHALLENGER_TRUE + CHALLENGER_TRUE:Y2016 +",
+                              "CHALLENGER_TRUE:Y2020 + LOG_N_WORDS + LOG_N_WORDS:Y2016 +",
+                              "LOG_N_WORDS:Y2020 | RACE_ID")), data = z, vcov = ~ MUNI)
+  terms <- c("CHALLENGER_TRUE:Y2016", "CHALLENGER_TRUE:Y2020")
+  if (length(setdiff(terms, names(coef(m))))) stop("Year interaction dropped for ", v)
+  b <- coef(m)[terms]; V <- vcov(m)[terms, terms]
+  df2 <- fixest::degrees_freedom(m, type = "t")
+  f_stat <- drop(t(b) %*% solve(V, b)) / length(terms)
+  bind_rows(
+    contrast_pp(m, z, c("CHALLENGER_TRUE:Y2016" = 1)) |> mutate(term = "2016 minus 2012"),
+    contrast_pp(m, z, c("CHALLENGER_TRUE:Y2020" = 1)) |> mutate(term = "2020 minus 2012")
+  ) |> mutate(key = k, outcome = LABELS[[k]], joint_f = f_stat, joint_df1 = length(terms),
+              joint_df2 = df2, joint_p = pf(f_stat, length(terms), df2, lower.tail = FALSE))
+})
+wr(year_het, "t_h2_year_heterogeneity")
+
 # H1: binary transparency regressor, binary election outcome. Scale coefficient
 # and uncertainty by 100 only at reporting, giving the 0-to-1 contrast in pp.
+# Main specifications control for incumbency: challengers use transparency more
+# and win less often, so an unadjusted estimate mixes the two. They also keep
+# only races whose winner has usable text; in the other races every observed
+# candidate lost, which adds no information and dilutes the estimate. The
+# previous specification is reported for comparison and should not be the main
+# electoral result.
+H1_SPECS <- list(
+  "Race FE + incumbency" =
+    list(f = ELECTED ~ TALK + INCUMBENT_TRUE + LOG_N_WORDS | RACE_ID, adjusted = TRUE),
+  "Race + party FE + incumbency" =
+    list(f = ELECTED ~ TALK + INCUMBENT_TRUE + LOG_N_WORDS | RACE_ID + PARTY_F, adjusted = TRUE),
+  "Race FE, no incumbency control (previous)" =
+    list(f = ELECTED ~ TALK + LOG_N_WORDS | RACE_ID, adjusted = FALSE))
+
 h1 <- imap_dfr(TVAR, function(v, k) {
-  z <- d |> filter(SAMPLE_H1 == 1, !is.na(.data[[v]]), is.finite(LOG_N_WORDS)) |>
+  base <- d |> filter(SAMPLE_H1 == 1, !is.na(.data[[v]]), is.finite(LOG_N_WORDS)) |>
     mutate(TALK = .data[[v]])
-  map_dfr(c("Race FE", "Race + party FE"), function(spec) {
-    f <- if (spec == "Race FE") ELECTED ~ TALK + LOG_N_WORDS | RACE_ID else
-      ELECTED ~ TALK + LOG_N_WORDS | RACE_ID + PARTY_F
-    m <- feols(f, data = z, vcov = ~ MUNI)
+  adjusted <- base |> filter(!is.na(INCUMBENT_TRUE)) |>
+    group_by(RACE_ID) |> filter(any(ELECTED == 1L)) |> ungroup()
+  imap_dfr(H1_SPECS, function(s, spec) {
+    z <- if (s$adjusted) adjusted else base
+    m <- feols(s$f, data = z, vcov = ~ MUNI)
     coefficient_pp(m, z, "TALK") |>
       mutate(key = k, outcome = LABELS[[k]], spec = spec,
+             sample = if (s$adjusted) "Known incumbency; winner's plan observed" else "SAMPLE_H1",
              ci90_low = estimate - qt(.95, df) * std.error,
              ci90_high = estimate + qt(.95, df) * std.error,
              sesoi_pp = SESOI_PP,
@@ -259,6 +370,11 @@ h1 <- imap_dfr(TVAR, function(v, k) {
              equivalent = if (is.na(SESOI_PP)) NA else ci90_low > -SESOI_PP & ci90_high < SESOI_PP)
   })
 }) |> group_by(spec) |> mutate(p_holm = p.adjust(p.value, "holm")) |> ungroup()
+
+# Checkpoints from the verified revised run (September 2026).
+stopifnot(all(h1$n[h1$sample != "SAMPLE_H1"] == 29856L),
+          all(h1$n_races[h1$sample != "SAMPLE_H1"] == 10631L),
+          all(h1$n[h1$sample == "SAMPLE_H1"] == 33142L))
 
 wr(h1, "t_h1_electoral_association")
 
@@ -271,65 +387,82 @@ h3base <- d |> filter(TEXT_OBSERVED == 1, VALID_RANKING_TRUE == 1,
 paired <- function(z, v) z |> filter(!is.na(.data[[v]])) |>
   group_by(RACE_ID) |>
   filter(sum(TRUE_RUNNER_UP == 1) == 1, sum(TRUE_RUNNER_UP == 0) >= 1) |> ungroup()
-absolute <- list(); predictions <- list(); relative <- list(); interactions <- list()
-for (k in names(TVAR)) {
-  v <- TVAR[[k]]
-  z <- paired(h3base |> filter(TRUE_RANK <= 2), v)
-  stopifnot(all(table(z$RACE_ID) == 2))
-  m <- feols(as.formula(paste(v,
-                              "~ TRUE_RUNNER_UP + TRUE_MARGIN_10PP + RUNNER_MARGIN + LOG_N_WORDS | MUNI + YEAR")),
-             data = z, vcov = ~ MUNI)
-  absolute[[k]] <- bind_rows(
-    contrast_pp(m, z, c(TRUE_MARGIN_10PP = 1)) |> mutate(role = "Leader"),
-    contrast_pp(m, z, c(TRUE_MARGIN_10PP = 1, RUNNER_MARGIN = 1)) |> mutate(role = "Runner-up")
-  ) |> mutate(key = k, outcome = LABELS[[k]])
-  # Standardized levels are point estimates only: slope vcov alone does not
-  # capture the uncertainty in the absorbed fixed effects used in predictions.
-  used <- z[fixest::obs(m), , drop = FALSE]
-  predictions[[k]] <- crossing(role_code = c(0L, 1L), margin_pp = MARGINS_PP) |>
-    pmap_dfr(function(role_code, margin_pp) {
-      nd <- used |> mutate(TRUE_RUNNER_UP = role_code,
-                           TRUE_MARGIN_10PP = margin_pp / 10,
-                           RUNNER_MARGIN = role_code * margin_pp / 10)
-      tibble(key = k, outcome = LABELS[[k]], role = if (role_code == 0) "Leader" else "Runner-up",
-             margin_pp = margin_pp, predicted_probability_pp = 100 * mean(predict(m, newdata = nd)))
-    })
-  specs <- list(
-    "Runner-up minus leader" = h3base |> filter(TRUE_RANK <= 2),
-    "Runner-up minus lower-ranked candidates" = h3base |> filter(TRUE_RANK >= 2),
-    "Runner-up challenger minus lower-ranked challengers" = h3base |>
-      filter(SAMPLE_H2 == 1, CHALLENGER_TRUE == 1, TRUE_RANK >= 2))
-  relative_k <- list()
-  for (label in names(specs)) {
-    zz <- paired(specs[[label]], v)
-    if (!nrow(zz)) stop("Empty H3 comparison: ", label)
-    mm <- feols(as.formula(paste(v, "~ TRUE_RUNNER_UP + RUNNER_MARGIN + LOG_N_WORDS | RACE_ID")),
-                data = zz, vcov = ~ MUNI)
-    interactions[[paste(k, label)]] <- coefficient_pp(mm, zz, "RUNNER_MARGIN") |>
-      mutate(key = k, outcome = LABELS[[k]], comparison = label)
-    relative_k[[label]] <- map_dfr(MARGINS_PP, function(margin)
-      contrast_pp(mm, zz, c(TRUE_RUNNER_UP = 1, RUNNER_MARGIN = margin / 10)) |>
-        mutate(key = k, outcome = LABELS[[k]], comparison = label, margin_pp = margin))
+
+# The H3 models, unchanged, wrapped so they can be rerun on a restricted base.
+run_h3 <- function(h3base, with_predictions = TRUE) {
+  absolute <- list(); predictions <- list(); relative <- list(); interactions <- list()
+  for (k in names(TVAR)) {
+    v <- TVAR[[k]]
+    z <- paired(h3base |> filter(TRUE_RANK <= 2), v)
+    stopifnot(all(table(z$RACE_ID) == 2))
+    m <- feols(as.formula(paste(v,
+                                "~ TRUE_RUNNER_UP + TRUE_MARGIN_10PP + RUNNER_MARGIN + LOG_N_WORDS | MUNI + YEAR")),
+               data = z, vcov = ~ MUNI)
+    absolute[[k]] <- bind_rows(
+      contrast_pp(m, z, c(TRUE_MARGIN_10PP = 1)) |> mutate(role = "Leader"),
+      contrast_pp(m, z, c(TRUE_MARGIN_10PP = 1, RUNNER_MARGIN = 1)) |> mutate(role = "Runner-up")
+    ) |> mutate(key = k, outcome = LABELS[[k]])
+    # Standardized levels are point estimates only: slope vcov alone does not
+    # capture the uncertainty in the absorbed fixed effects used in predictions.
+    if (with_predictions) {
+      used <- z[fixest::obs(m), , drop = FALSE]
+      predictions[[k]] <- crossing(role_code = c(0L, 1L), margin_pp = MARGINS_PP) |>
+        pmap_dfr(function(role_code, margin_pp) {
+          nd <- used |> mutate(TRUE_RUNNER_UP = role_code,
+                               TRUE_MARGIN_10PP = margin_pp / 10,
+                               RUNNER_MARGIN = role_code * margin_pp / 10)
+          tibble(key = k, outcome = LABELS[[k]], role = if (role_code == 0) "Leader" else "Runner-up",
+                 margin_pp = margin_pp, predicted_probability_pp = 100 * mean(predict(m, newdata = nd)))
+        })
+    }
+    specs <- list(
+      "Runner-up minus leader" = h3base |> filter(TRUE_RANK <= 2),
+      "Runner-up minus lower-ranked candidates" = h3base |> filter(TRUE_RANK >= 2),
+      "Runner-up challenger minus lower-ranked challengers" = h3base |>
+        filter(SAMPLE_H2 == 1, CHALLENGER_TRUE == 1, TRUE_RANK >= 2))
+    relative_k <- list()
+    for (label in names(specs)) {
+      zz <- paired(specs[[label]], v)
+      if (!nrow(zz)) stop("Empty H3 comparison: ", label)
+      mm <- feols(as.formula(paste(v, "~ TRUE_RUNNER_UP + RUNNER_MARGIN + LOG_N_WORDS | RACE_ID")),
+                  data = zz, vcov = ~ MUNI)
+      interactions[[paste(k, label)]] <- coefficient_pp(mm, zz, "RUNNER_MARGIN") |>
+        mutate(key = k, outcome = LABELS[[k]], comparison = label)
+      relative_k[[label]] <- map_dfr(MARGINS_PP, function(margin)
+        contrast_pp(mm, zz, c(TRUE_RUNNER_UP = 1, RUNNER_MARGIN = margin / 10)) |>
+          mutate(key = k, outcome = LABELS[[k]], comparison = label, margin_pp = margin))
+    }
+    relative[[k]] <- bind_rows(relative_k)
   }
-  relative[[k]] <- bind_rows(relative_k)
+  list(
+    absolute = bind_rows(absolute) |> group_by(role) |>
+      mutate(p_holm = p.adjust(p.value, "holm")) |> ungroup(),
+    predictions = bind_rows(predictions),
+    relative = bind_rows(relative) |> group_by(comparison, margin_pp) |>
+      mutate(p_holm = p.adjust(p.value, "holm")) |> ungroup(),
+    interactions = bind_rows(interactions) |> group_by(comparison) |>
+      mutate(p_holm = p.adjust(p.value, "holm")) |> ungroup())
 }
 
-absolute <- bind_rows(absolute) |> group_by(role) |>
-  mutate(p_holm = p.adjust(p.value, "holm")) |> ungroup()
+h3 <- run_h3(h3base)
+wr(h3$absolute, "t_h3_absolute_margin_slopes")
+wr(h3$predictions, "t_h3_standardized_predictions")
+wr(h3$relative, "t_h3_relative_contrasts_5_10_20pp")
+wr(h3$interactions, "t_h3_relative_margin_interactions")
 
-relative <- bind_rows(relative) |> group_by(comparison, margin_pp) |>
-  mutate(p_holm = p.adjust(p.value, "holm")) |> ungroup()
-
-interactions <- bind_rows(interactions) |> group_by(comparison) |>
-  mutate(p_holm = p.adjust(p.value, "holm")) |> ungroup()
-
-wr(absolute, "t_h3_absolute_margin_slopes")
-
-wr(bind_rows(predictions), "t_h3_standardized_predictions")
-
-wr(relative, "t_h3_relative_contrasts_5_10_20pp")
-
-wr(interactions, "t_h3_relative_margin_interactions")
+# H3 sensitivity: ranks and margins count votes received, including votes for
+# candidates whose registration was later denied, cancelled or withdrawn (legally
+# annulled). Drop races where such a candidate is in the population top two.
+annulled_top2 <- d |>
+  filter(TRUE_RANK <= 2, !des_situacao_candidatura %in% APPROVED_STATUS) |>
+  distinct(RACE_ID) |> pull(RACE_ID)
+wr(d |> distinct(RACE_ID, YEAR) |>
+     mutate(annulled_top2 = RACE_ID %in% annulled_top2) |>
+     count(YEAR, annulled_top2, name = "races"), "t_h3_annulled_vote_races")
+h3_reg <- run_h3(h3base |> filter(!RACE_ID %in% annulled_top2), with_predictions = FALSE)
+wr(h3_reg$absolute, "t_h3_absolute_margin_slopes_registered_top2")
+wr(h3_reg$relative, "t_h3_relative_contrasts_registered_top2")
+wr(h3_reg$interactions, "t_h3_relative_margin_interactions_registered_top2")
 
 # Descriptive worst-case prevalence bounds, not bounds on a causal/FE effect.
 manski <- function(z, v) {
@@ -410,19 +543,23 @@ output_names <- unique(c(output_names, "fig2_challenger_effects.png", "session_0
 # ------------------------------------------------------------------------------
 # Saving outputs ---------------------------------------------------------------
 # ------------------------------------------------------------------------------
-existing <- googledrive::drive_ls(drive_folder)
-duplicates <- existing |> filter(name %in% output_names) |> count(name) |> filter(n > 1L)
-if (nrow(duplicates))
-  stop("Duplicate output filenames in Drive: ", paste(duplicates$name, collapse = ", "))
-missing_local <- output_names[!file.exists(file.path(OUT_DIR, output_names))]
-if (length(missing_local))
-  stop("Expected local outputs are missing: ", paste(missing_local, collapse = ", "))
-tryCatch({
-  for (name in output_names)
-    googledrive::drive_put(file.path(OUT_DIR, name), path = drive_folder, name = name)
-}, error = function(e) {
-  stop("Drive upload did not finish. Local outputs remain in ",
-       normalizePath(OUT_DIR, winslash = "/"),
-       ". Some Drive files may already be updated; rerun after resolving: ",
-       conditionMessage(e), call. = FALSE)
-})
+if (!UPLOAD) {
+  message("MAYORAL_UPLOAD is FALSE: outputs kept in ", normalizePath(OUT_DIR, winslash = "/"))
+} else {
+  existing <- googledrive::drive_ls(drive_folder)
+  duplicates <- existing |> filter(name %in% output_names) |> count(name) |> filter(n > 1L)
+  if (nrow(duplicates))
+    stop("Duplicate output filenames in Drive: ", paste(duplicates$name, collapse = ", "))
+  missing_local <- output_names[!file.exists(file.path(OUT_DIR, output_names))]
+  if (length(missing_local))
+    stop("Expected local outputs are missing: ", paste(missing_local, collapse = ", "))
+  tryCatch({
+    for (name in output_names)
+      googledrive::drive_put(file.path(OUT_DIR, name), path = drive_folder, name = name)
+  }, error = function(e) {
+    stop("Drive upload did not finish. Local outputs remain in ",
+         normalizePath(OUT_DIR, winslash = "/"),
+         ". Some Drive files may already be updated; rerun after resolving: ",
+         conditionMessage(e), call. = FALSE)
+  })
+}
